@@ -1,0 +1,10 @@
+{
+  "sensors": [
+    "00:11:22:33:44:55",
+    "AA:BB:CC:DD:EE:FF"
+  ],
+  "polling_interval_seconds": 1.0,
+  "ntfy_channel_id": "SOME CHANNEL",
+  "door_open_threshold_minutes": 10.0,
+  "notification_repeat_interval_seconds": 60.0
+}
