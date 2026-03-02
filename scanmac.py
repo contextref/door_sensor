@@ -1,57 +1,26 @@
 import asyncio
-import time
 from bleak import BleakScanner
 
-# Your specific sensor's MAC address
-TARGET_MAC = "D2:2D:84:06:32:0C"
-# Govee Manufacturer ID for H5123 (0xEF88)
-GOVEE_BT_ID = 61320
-
-def handle_detection(device, advertisement_data):
-    # Filter by MAC address (case-insensitive)
-    if device.address.upper() == TARGET_MAC.upper():
-        print(f"[{time.strftime('%H:%M:%S')}] Advertisement: {advertisement_data}")
-
-        # Check if Manufacturer Data is present
-        if GOVEE_BT_ID in advertisement_data.manufacturer_data:
-            data = advertisement_data.manufacturer_data[GOVEE_BT_ID]
-
-            # Based on user data:
-            # Opening: index 3 is 0xd7 (215)
-            # Closing: index 3 is 0xd8 (216)
-            if len(data) >= 4:
-                state_byte = data[3]
-                if state_byte == 0xd7:
-                    state = "OPEN"
-                elif state_byte == 0xd8:
-                    state = "CLOSED"
-                else:
-                    state = f"UNKNOWN (0x{state_byte:02x})"
-                
-                rssi = advertisement_data.rssi
-                print(f"--- SENSOR UPDATE ---")
-                print(f"Status: {state}")
-                print(f"Signal Strength (RSSI): {rssi} dBm")
-                print(f"Raw Data: {data.hex()}\n")
-
 async def run():
-    print(f"Monitoring Govee H5123 [{TARGET_MAC}]...")
-    print("Move the magnet to trigger a broadcast.")
-
-    # active=True is vital for Govee on Raspberry Pi
-    scanner = BleakScanner(
-        detection_callback=handle_detection,
-        scanning_mode="active"
-    )
-
-    await scanner.start()
+    print("--- SYSTEM BLUETOOTH CHECK ---")
     try:
-        # We keep the script alive indefinitely
-        while True:
-            await asyncio.sleep(1.0)
-    except KeyboardInterrupt:
-        print("\nStopping scanner...")
-        await scanner.stop()
+        # 1. Try to list all controllers/adapters
+        print("Searching for Bluetooth adapters...")
+        # (This is a simpler way to see if the backend is alive)
+        devices = await BleakScanner.discover(timeout=5.0)
+        
+        if not devices:
+            print("RESULT: No devices found in 5 seconds. Bluetooth is likely hung or blocked.")
+        else:
+            print(f"RESULT: Found {len(devices)} devices. Bluetooth is WORKING.")
+            for d in devices:
+                print(f"  - [{d.address}] {d.name or 'Unknown'}")
+                
+    except Exception as e:
+        print(f"CRITICAL ERROR: {e}")
+        print("\nPossible fixes:")
+        print("1. Run with: sudo python3 scanmac.py")
+        print("2. Run: sudo hciconfig hci0 up")
 
 if __name__ == "__main__":
     asyncio.run(run())

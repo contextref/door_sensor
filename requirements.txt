@@ -1,1 +1,3 @@
 bleak>=0.21.0
+govee-ble
+home-assistant-bluetooth
