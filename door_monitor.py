@@ -4,14 +4,14 @@ import time
 import urllib.request
 import os
 import sys
-
-# Optional import, user needs to implement the logic inside check_sensor_is_open
-try:
-    from bleak import BleakClient
-except ImportError:
-    print("Warning: bleak library not found. Please install it with 'pip install -r requirements.txt'")
+from bleak import BleakScanner
 
 CONFIG_FILE = "config.json"
+GOVEE_MANUFACTURER_ID = 61320
+
+# Global state to track sensor status
+# mac_address -> is_open (bool)
+sensors_current_state = {}
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -36,35 +36,21 @@ def send_notification(channel_id, message):
     except Exception as e:
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Error sending notification: {e}")
 
-async def check_sensor_is_open(mac_address):
-    """
-    Connects to the Bluetooth device and checks if the door is open.
-    Returns:
-        True if the door is open.
-        False if the door is closed.
-        None if the state could not be determined.
-    """
-    # TODO: Implement the exact door closure logic here.
-    # The bleak code will go here, currently returning None so it doesn't do anything
-    # Example using BleakClient:
-    # try:
-    #     async with BleakClient(mac_address, timeout=5.0) as client:
-    #         if not client.is_connected:
-    #             return None
-    #         # Replace with your actual characteristic UUID
-    #         # data = await client.read_gatt_char("0000xxxx-0000-1000-8000-00805f9b34fb")
-    #         # Parse data to determine if open or closed
-    #         # is_open = (data[0] == 0x01)
-    #         # return is_open
-    #         pass
-    # except Exception as e:
-    #     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Error connecting to {mac_address}: {e}")
-    #     return None
-    return None
+def handle_detection(device, advertisement_data, monitored_macs):
+    mac = device.address.upper()
+    if mac in monitored_macs:
+        if GOVEE_MANUFACTURER_ID in advertisement_data.manufacturer_data:
+            data = advertisement_data.manufacturer_data[GOVEE_MANUFACTURER_ID]
+            # Based on user data:
+            # Opening: index 3 is 0xd7
+            # Closing: index 3 is 0xd8
+            if len(data) >= 4:
+                is_open = (data[3] == 0xd7)
+                sensors_current_state[mac] = is_open
 
 async def main():
     config = load_config()
-    sensors = config.get("sensors", [])
+    sensors = [mac.upper() for mac in config.get("sensors", [])]
     interval = config.get("polling_interval_seconds", 1.0)
     channel_id = config.get("ntfy_channel_id")
     threshold_minutes = config.get("door_open_threshold_minutes", 10.0)
@@ -80,56 +66,66 @@ async def main():
         print("Warning: No sensors specified in config. Application will run but do nothing.")
         
     print(f"Starting door monitor for {len(sensors)} sensors.")
-    print(f"Polling interval: {interval} seconds.")
+    print(f"Check interval: {interval} seconds.")
     print(f"Notification threshold: {threshold_minutes} minutes.")
     print(f"Notification channel: {channel_id}")
 
-    # State tracking
+    # State tracking for notifications
     # mac_address -> timestamp of when it was first detected open
     open_sensors_start_time = {}
     
     # Track when we last sent a notification to avoid spamming
     last_notification_time = {}
 
-    while True:
-        for mac in sensors:
-            try:
-                is_open = await check_sensor_is_open(mac)
-            except Exception as e:
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Error checking sensor {mac}: {e}")
-                is_open = None
-            
-            now = time.time()
-            
-            if is_open is True:
-                # Door is currently open
-                if mac not in open_sensors_start_time:
-                    open_sensors_start_time[mac] = now
-                    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Sensor {mac} detected OPEN.")
-                
-                open_duration = now - open_sensors_start_time[mac]
-                
-                if open_duration >= threshold_seconds:
-                    # Check if we should send a notification
-                    last_notified = last_notification_time.get(mac, 0)
-                    if now - last_notified >= repeat_interval:
-                        message = f"Door Sensor {mac} has been open for {int(open_duration // 60)} minutes!"
-                        send_notification(channel_id, message)
-                        last_notification_time[mac] = now
-                        
-            elif is_open is False:
-                # Door is closed
-                if mac in open_sensors_start_time:
-                    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Sensor {mac} detected CLOSED.")
-                    del open_sensors_start_time[mac]
-                if mac in last_notification_time:
-                    del last_notification_time[mac]
-                    
-            elif is_open is None:
-                # Could not read state or not implemented yet
-                pass
+    monitored_macs = set(sensors)
 
-        await asyncio.sleep(interval)
+    # Start the scanner
+    scanner = BleakScanner(
+        detection_callback=lambda d, a: handle_detection(d, a, monitored_macs),
+        scanning_mode="active"
+    )
+
+    await scanner.start()
+    print("Scanner started. Waiting for advertisements...")
+
+    try:
+        while True:
+            now = time.time()
+            for mac in sensors:
+                is_open = sensors_current_state.get(mac)
+                
+                if is_open is True:
+                    # Door is currently open
+                    if mac not in open_sensors_start_time:
+                        open_sensors_start_time[mac] = now
+                        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Sensor {mac} detected OPEN.")
+                    
+                    open_duration = now - open_sensors_start_time[mac]
+                    
+                    if open_duration >= threshold_seconds:
+                        # Check if we should send a notification
+                        last_notified = last_notification_time.get(mac, 0)
+                        if now - last_notified >= repeat_interval:
+                            message = f"Door Sensor {mac} has been open for {int(open_duration // 60)} minutes!"
+                            send_notification(channel_id, message)
+                            last_notification_time[mac] = now
+                            
+                elif is_open is False:
+                    # Door is closed
+                    if mac in open_sensors_start_time:
+                        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Sensor {mac} detected CLOSED.")
+                        del open_sensors_start_time[mac]
+                    if mac in last_notification_time:
+                        del last_notification_time[mac]
+                        
+                # If is_open is None, we haven't seen an advertisement for this sensor yet
+
+            await asyncio.sleep(interval)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        print("Stopping scanner...")
+        await scanner.stop()
 
 if __name__ == "__main__":
     try:
