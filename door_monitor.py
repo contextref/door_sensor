@@ -37,20 +37,27 @@ def send_notification(channel_id, message):
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Error sending notification: {e}")
 
 def handle_detection(device, advertisement_data, monitored_macs):
-    mac = device.address.upper()
-    if mac in monitored_macs:
+    try:
+        mac = device.address.upper()
         if GOVEE_MANUFACTURER_ID in advertisement_data.manufacturer_data:
-            data = advertisement_data.manufacturer_data[GOVEE_MANUFACTURER_ID]
-            # Based on user data:
-            # Opening: index 3 is 0xd7
-            # Closing: index 3 is 0xd8
-            if len(data) >= 4:
-                is_open = (data[3] == 0xd7)
-                sensors_current_state[mac] = is_open
+            if mac in monitored_macs:
+                data = advertisement_data.manufacturer_data[GOVEE_MANUFACTURER_ID]
+                if len(data) >= 4:
+                    is_open = (data[3] == 0xd7)
+                    sensors_current_state[mac] = is_open
+            else:
+                # Log once in a while or just once per unknown sensor to help user find the right MAC
+                if not hasattr(handle_detection, "_seen_unknown"):
+                    handle_detection._seen_unknown = set()
+                if mac not in handle_detection._seen_unknown:
+                    print(f"[{time.strftime('%H:%M:%S')}] Info: Detected Govee sensor {mac} (Not in config.json)")
+                    handle_detection._seen_unknown.add(mac)
+    except Exception as e:
+        print(f"Error in detection callback: {e}")
 
 async def main():
     config = load_config()
-    sensors = [mac.upper() for mac in config.get("sensors", [])]
+    sensors = [mac.strip().upper() for mac in config.get("sensors", [])]
     interval = config.get("polling_interval_seconds", 1.0)
     channel_id = config.get("ntfy_channel_id")
     threshold_minutes = config.get("door_open_threshold_minutes", 10.0)
@@ -66,6 +73,7 @@ async def main():
         print("Warning: No sensors specified in config. Application will run but do nothing.")
         
     print(f"Starting door monitor for {len(sensors)} sensors.")
+    print(f"Monitored MACs: {', '.join(sensors)}")
     print(f"Check interval: {interval} seconds.")
     print(f"Notification threshold: {threshold_minutes} minutes.")
     print(f"Notification channel: {channel_id}")
@@ -88,12 +96,26 @@ async def main():
     await scanner.start()
     print("Scanner started. Waiting for advertisements...")
 
+    # Track if we have already printed a 'waiting' message to avoid spam
+    waiting_message_shown = set()
+
     try:
         while True:
             now = time.time()
             for mac in sensors:
                 is_open = sensors_current_state.get(mac)
                 
+                if is_open is None:
+                    # Sensor not yet detected in advertisements
+                    if mac not in waiting_message_shown:
+                        print(f"[{time.strftime('%H:%M:%S')}] Waiting for first advertisement from {mac}...")
+                        waiting_message_shown.add(mac)
+                    continue
+                
+                # If we were waiting, we got it now
+                if mac in waiting_message_shown:
+                    waiting_message_shown.remove(mac)
+
                 if is_open is True:
                     # Door is currently open
                     if mac not in open_sensors_start_time:
