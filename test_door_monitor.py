@@ -8,8 +8,10 @@ import os
 # Mock missing modules for the test environment
 mock_govee = MagicMock()
 mock_ha_bt = MagicMock()
+mock_dotenv = MagicMock()
 sys.modules["govee_ble"] = mock_govee
 sys.modules["home_assistant_bluetooth"] = mock_ha_bt
+sys.modules["dotenv"] = mock_dotenv
 
 # Add the current directory to sys.path so we can import door_monitor
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -18,12 +20,6 @@ import door_monitor
 class TestDoorMonitor(unittest.TestCase):
 
     def setUp(self):
-        self.config = {
-            "polling_interval_seconds": 0.1,
-            "ntfy_channel_id": "test-channel",
-            "door_open_threshold_minutes": 0.01, # ~0.6 seconds for testing
-            "notification_repeat_interval_seconds": 0.5
-        }
         # Clear global state before each test
         door_monitor.sensors_current_state = {}
         door_monitor.sensors_metadata = {}
@@ -43,12 +39,19 @@ class TestDoorMonitor(unittest.TestCase):
         door_monitor.send_notification("test-channel", "Test Message")
         mock_urlopen.assert_called_once()
 
-    @patch('door_monitor.load_config')
+    @patch('door_monitor.os.getenv')
     @patch('door_monitor.BleakScanner')
     @patch('door_monitor.send_notification')
     @patch('door_monitor.asyncio.sleep')
-    def test_main_loop_discovery_and_detection(self, mock_sleep, mock_notify, mock_scanner, mock_load_config):
-        mock_load_config.return_value = self.config
+    def test_main_loop_discovery_and_detection(self, mock_sleep, mock_notify, mock_scanner, mock_getenv):
+        # Setup mocks
+        mock_getenv.side_effect = lambda k, default=None: {
+            "NTFY_CHANNEL_ID": "test-channel",
+            "POLLING_INTERVAL_SECONDS": "0.1",
+            "DOOR_OPEN_THRESHOLD_MINUTES": "0.01",
+            "NOTIFICATION_REPEAT_INTERVAL_SECONDS": "0.5"
+        }.get(k, default)
+        
         self.setup_mock_scanner(mock_scanner)
         
         mac = "D2:2D:84:06:32:0C"
@@ -111,18 +114,25 @@ class TestDoorMonitor(unittest.TestCase):
         self.assertTrue(door_monitor.sensors_current_state["D2:2D:84:06:32:0C"])
         self.assertEqual(door_monitor.sensors_metadata["D2:2D:84:06:32:0C"]["model"], "H5123")
 
-    def test_handle_detection_unsupported(self):
+    def test_handle_detection_fallback(self):
+        # Library doesn't support this packet
         mock_parser_class = door_monitor.GoveeBluetoothDeviceData
         mock_parser_instance = mock_parser_class.return_value
-        mock_parser_instance.supported.return_value = False
-        
+        mock_parser_instance.supported.return_value = True
+        update = MagicMock()
+        update.binary_entity_values = {} # No binary values found by lib
+        mock_parser_instance.update.return_value = update
+
         device = MagicMock()
-        device.address = "AA:BB:CC:DD:EE:FF"
+        device.address = "D2:2D:84:06:32:0C"
         adv_data = MagicMock()
         adv_data.rssi = -50
+        # Manual bitwise state at index 4: bit 0 = 1 (OPEN)
+        adv_data.manufacturer_data = {61320: bytes([0x13, 0xb6, 0x03, 0xff, 0x01])}
         
         door_monitor.handle_detection(device, adv_data)
-        self.assertNotIn("AA:BB:CC:DD:EE:FF", door_monitor.sensors_current_state)
+        self.assertIn("D2:2D:84:06:32:0C", door_monitor.sensors_current_state)
+        self.assertTrue(door_monitor.sensors_current_state["D2:2D:84:06:32:0C"])
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,14 +1,16 @@
 import asyncio
-import json
 import time
 import urllib.request
 import os
 import sys
+from dotenv import load_dotenv
 from bleak import BleakScanner
 from govee_ble import GoveeBluetoothDeviceData
 from home_assistant_bluetooth import BluetoothServiceInfo
 
-CONFIG_FILE = "config.json"
+# Load environment variables from .env file
+load_dotenv()
+
 GOVEE_MANUFACTURER_ID = 61320
 
 # Global state to track sensor status
@@ -16,17 +18,6 @@ GOVEE_MANUFACTURER_ID = 61320
 sensors_current_state = {}
 # mac_address -> metadata (dict with model, name)
 sensors_metadata = {}
-
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        print(f"Error: {CONFIG_FILE} not found. Please create it.")
-        sys.exit(1)
-    try:
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
-    except json.JSONDecodeError as e:
-        print(f"Error parsing {CONFIG_FILE}: {e}")
-        sys.exit(1)
 
 def send_notification(channel_id, message):
     url = f"https://ntfy.sh/{channel_id}"
@@ -90,19 +81,18 @@ def handle_detection(device, advertisement_data):
         print(f"Error in detection callback: {e}")
 
 async def main():
-    config = load_config()
-    interval = config.get("polling_interval_seconds", 1.0)
-    channel_id = config.get("ntfy_channel_id")
-    threshold_minutes = config.get("door_open_threshold_minutes", 10.0)
-    repeat_interval = config.get("notification_repeat_interval_seconds", 60.0)
+    channel_id = os.getenv("NTFY_CHANNEL_ID")
+    interval = float(os.getenv("POLLING_INTERVAL_SECONDS", "1.0"))
+    threshold_minutes = float(os.getenv("DOOR_OPEN_THRESHOLD_MINUTES", "10.0"))
+    repeat_interval = float(os.getenv("NOTIFICATION_REPEAT_INTERVAL_SECONDS", "60.0"))
     
     threshold_seconds = threshold_minutes * 60
 
     if not channel_id:
-        print("Error: 'ntfy_channel_id' must be specified in config.")
+        print("Error: NTFY_CHANNEL_ID must be set in .env file.")
         sys.exit(1)
         
-    print(f"Starting auto-discovery door monitor.")
+    print(f"Starting auto-discovery door monitor (using .env).")
     print(f"Check interval: {interval} seconds.")
     print(f"Notification threshold: {threshold_minutes} minutes.")
 
