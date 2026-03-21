@@ -6,8 +6,6 @@ edition = "2021"
 [dependencies]
 btleplug = "0.11"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["native-tls", "json", "blocking"], default-features = false } 
-openssl = { version = "0.10", features = ["vendored"] }
 dotenvy = "0.15"
 aes = "0.8"
 cipher = "0.4"
@@ -15,9 +13,13 @@ chrono = "0.4"
 futures = "0.3"
 hex = "0.4"
 crc16 = "0.4"
-dbus = { version = "0.9", features = ["vendored"] }
 getrandom = "=0.2.15"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+reqwest = { version = "0.12", features = ["native-tls", "json", "blocking"], default-features = false } 
+openssl = { version = "0.10", features = ["vendored"] }
+dbus = { version = "0.9", features = ["vendored"] }
 zbus = "4.0"
 
-
-
+[target.'cfg(target_os = "macos")'.dependencies]
+reqwest = { version = "0.12", features = ["rustls-tls", "json", "blocking"], default-features = false } 

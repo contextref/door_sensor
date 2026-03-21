@@ -31,12 +31,18 @@ Some crates are notorious for failing on ARMv6 due to optimized assembly.
 
 ### TLS / HTTPS (`reqwest`)
 *   **Issue:** The `rustls` crate depends on `ring`, which contains ARMv7-specific assembly that causes `Illegal instruction` on Pi Zero.
-*   **Solution:** Use `native-tls` with the `vendored` feature. This compiles OpenSSL from source specifically for the target CPU.
-    ```toml
-    [dependencies]
-    reqwest = { version = "0.12", features = ["native-tls", "json", "blocking"], default-features = false }
-    openssl = { version = "0.10", features = ["vendored"] }
-    ```
+*   **Solution:** Use target-specific dependencies to use `native-tls` on Linux and `rustls-tls` on macOS. This avoids OpenSSL/DBus issues on Mac while keeping the Pi build compatible.
+
+```toml
+[target.'cfg(target_os = "linux")'.dependencies]
+reqwest = { version = "0.12", features = ["native-tls", "json", "blocking"], default-features = false }
+openssl = { version = "0.10", features = ["vendored"] }
+dbus = { version = "0.9", features = ["vendored"] }
+zbus = "4.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+reqwest = { version = "0.12", features = ["rustls-tls", "json", "blocking"], default-features = false }
+```
 
 ### D-Bus / Bluetooth (`btleplug`)
 *   **Issue:** Linking against system `libdbus` during cross-compilation is difficult and requires complex sysroots.
