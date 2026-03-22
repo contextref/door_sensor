@@ -1,11 +1,11 @@
 use aes::Aes128;
 use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
-use btleplug::api::{Central, Manager as _, ScanFilter};
+use btleplug::api::{Central, Manager as _, Peripheral, ScanFilter};
 use btleplug::platform::Manager;
 use chrono::{DateTime, Utc};
 use dotenvy::dotenv;
 use futures::stream::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -90,7 +90,9 @@ fn decrypt_h5123(data: &[u8]) -> Option<bool> {
 
 /// Fallback for unencrypted packets (based on your earlier manual analysis)
 fn parse_fallback(data: &[u8]) -> Option<bool> {
-    if data.len() >= 5 {
+    // Only use fallback for short packets (usually 7 bytes for unencrypted H5123)
+    // Encrypted H5123 packets are 24 bytes; if decryption failed, data[4] is random/encrypted.
+    if data.len() < 24 && data.len() >= 5 {
         // We found bit 0 of index 4 was the state indicator
         Some((data[4] & 0x01) == 1)
     } else {
@@ -99,6 +101,7 @@ fn parse_fallback(data: &[u8]) -> Option<bool> {
 }
 
 fn send_notification(channel_id: &str, message: &str) {
+// ... (rest of the file stays same until main event loop)
     let url = format!("https://ntfy.sh/{}", channel_id);
     let client = reqwest::blocking::Client::new();
     match client.post(&url).body(message.to_string()).send() {
@@ -141,13 +144,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Scanner started. Watching for Govee sensors...");
 
     // 3. Background Event Loop (Parser)
+    let central_clone = central.clone();
+    let mut ignored_devices = HashSet::new();
+    let mut govee_devices = HashSet::new();
+
     tokio::spawn(async move {
         while let Some(event) = events.next().await {
-            if let btleplug::api::CentralEvent::ManufacturerDataAdvertisement {
-                id,
-                manufacturer_data,
-            } = event {
-                if let Some(data) = manufacturer_data.get(&GOVEE_MANUFACTURER_ID) {
+            let (id, manufacturer_data): (btleplug::platform::PeripheralId, Option<HashMap<u16, Vec<u8>>>) = match event {
+                btleplug::api::CentralEvent::ManufacturerDataAdvertisement { id, manufacturer_data } => {
+                    (id, Some(manufacturer_data))
+                }
+                btleplug::api::CentralEvent::DeviceUpdated(id) => {
+                    if ignored_devices.contains(&id) {
+                        continue;
+                    }
+
+                    // On some Linux systems, property changes are better caught here
+                    if let Ok(peripheral) = central_clone.peripheral(&id).await {
+                        if let Ok(Some(props)) = peripheral.properties().await {
+                            let is_govee = props.manufacturer_data.contains_key(&GOVEE_MANUFACTURER_ID);
+                            
+                            if !is_govee && !govee_devices.contains(&id) {
+                                ignored_devices.insert(id.clone());
+                                continue;
+                            }
+                            
+                            if is_govee {
+                                govee_devices.insert(id.clone());
+                            }
+
+                            (id, Some(props.manufacturer_data))
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                _ => continue,
+            };
+
+            if let Some(data_map) = manufacturer_data {
+                if let Some(data) = data_map.get(&GOVEE_MANUFACTURER_ID) {
+                    println!("[DIAGNOSTIC] Govee signal: ID={:?}, data={:02X?}", id, data);
                     // Try Decryption first, then Fallback
                     let state = decrypt_h5123(data).or_else(|| parse_fallback(data));
 
@@ -166,10 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         });
 
-                        // Log every received advertisement state
-                        println!("[{}] {} status: {}", now.format("%H:%M:%S"), mac, if is_open { "OPEN" } else { "CLOSED" });
-
-                        // Handle state changes for notification logic
+                        // Handle state changes
                         if entry.is_open != is_open {
                             println!("[{}] {} state change: {} -> {}", now.format("%H:%M:%S"), mac, if entry.is_open { "OPEN" } else { "CLOSED" }, if is_open { "OPEN" } else { "CLOSED" });
                             entry.is_open = is_open;
@@ -180,6 +216,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 entry.last_notified = None;
                             }
                         }
+                        
+                        // Update last seen regardless of state change
                         entry.last_seen = now;
                     }
                 }
