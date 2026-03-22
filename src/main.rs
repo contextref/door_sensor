@@ -1,17 +1,18 @@
 use aes::Aes128;
 use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
-use btleplug::api::{Central, Manager as _, Peripheral, ScanFilter};
-use btleplug::platform::Manager;
 use chrono::{DateTime, Utc};
 use dotenvy::dotenv;
 use futures::stream::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time;
+use bluer::{AdapterEvent, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport};
 
 const GOVEE_MANUFACTURER_ID: u16 = 61320; // 0xEF88
+const GOVEE_ALT_ID: u16 = 60552; // 0xEC88
 
 #[derive(Debug, Clone)]
 struct SensorState {
@@ -19,6 +20,7 @@ struct SensorState {
     last_seen: DateTime<Utc>,
     open_since: Option<DateTime<Utc>>,
     last_notified: Option<DateTime<Utc>>,
+    last_packet_timestamp: u32,
 }
 
 fn calculate_govee_crc(data: &[u8]) -> u16 {
@@ -35,78 +37,41 @@ fn calculate_govee_crc(data: &[u8]) -> u16 {
     crc as u16
 }
 
-/// Decrypts H5123 manufacturer data (24-byte packet)
 fn decrypt_h5123(data: &[u8]) -> Option<bool> {
-    if data.len() < 24 {
-        return None;
-    }
-
+    if data.len() < 24 { return None; }
     let timestamp = &data[2..6];
     let enc_data = &data[6..22];
     let enc_crc = u16::from_be_bytes([data[22], data[23]]);
-    
-    // 1. Verify CRC
-    if calculate_govee_crc(enc_data) != enc_crc {
-        return None;
-    }
-
-    // 2. Build Key (Timestamp + 12 zeros)
+    if calculate_govee_crc(enc_data) != enc_crc { return None; }
     let mut key_bytes = [0u8; 16];
     key_bytes[0..4].copy_from_slice(timestamp);
-    
-    // Govee reverses everything: key and data
     let mut reversed_key = key_bytes;
     reversed_key.reverse();
-    
     let mut reversed_data = [0u8; 16];
     reversed_data.copy_from_slice(enc_data);
     reversed_data.reverse();
-    
-    // 3. Decrypt (AES-128-ECB)
     let key = GenericArray::from_slice(&reversed_key);
     let cipher = Aes128::new(key);
     let mut block = GenericArray::clone_from_slice(&reversed_data);
     cipher.decrypt_block(&mut block);
-
-    // 4. Reverse result back
     let mut decrypted = [0u8; 16];
     decrypted.copy_from_slice(block.as_slice());
     decrypted.reverse();
-
-    // Bytes: [0x01, 0x05, model_id, 0x02, battery, state, ...]
     let model_id = decrypted[2];
     let state_byte = decrypted[5];
-    
     if model_id == 2 {
         match state_byte {
             2 => Some(true),
             1 => Some(false),
             _ => None,
         }
-    } else {
-        None
-    }
+    } else { None }
 }
 
-/// Fallback for unencrypted packets (based on your earlier manual analysis)
 fn parse_fallback(data: &[u8]) -> Option<bool> {
-    // Only use fallback for short packets (usually 7 bytes for unencrypted H5123)
-    // Encrypted H5123 packets are 24 bytes; if decryption failed, data[4] is random/encrypted.
     if data.len() < 24 && data.len() >= 5 {
-        // We found bit 0 of index 4 was the state indicator
         Some((data[4] & 0x01) == 1)
-    } else {
-        None
-    }
-}
-
-fn normalize_mac(id: &str) -> String {
-    let id = id.to_uppercase();
-    if let Some(pos) = id.find("DEV_") {
-        id[pos + 4..].replace("_", ":")
-    } else {
-        id.replace("-", ":")
-    }
+    } else { None }
 }
 
 fn parse_denylist(raw: &str) -> HashSet<String> {
@@ -116,20 +81,44 @@ fn parse_denylist(raw: &str) -> HashSet<String> {
         .collect()
 }
 
+fn apply_sensor_update(
+    state: &mut SensorState,
+    is_open: bool,
+    packet_ts: u32,
+    now: DateTime<Utc>,
+    mac: &str,
+) -> bool {
+    let is_newer = packet_ts > state.last_packet_timestamp;
+    let is_reboot = if packet_ts < state.last_packet_timestamp {
+        (state.last_packet_timestamp - packet_ts) > 10000
+    } else { false };
+    let is_stale_timeout = (now - state.last_seen).num_seconds() > 10;
+
+    if !is_newer && !is_reboot && !is_stale_timeout { return false; }
+
+    state.last_seen = now;
+    state.last_packet_timestamp = packet_ts;
+
+    if state.is_open != is_open {
+        println!(
+            "[{}] {} state change: {} -> {} (TS: {})",
+            now.format("%H:%M:%S"), mac,
+            if state.is_open { "OPEN" } else { "CLOSED" },
+            if is_open { "OPEN" } else { "CLOSED" },
+            packet_ts
+        );
+        state.is_open = is_open;
+        state.open_since = if is_open { Some(now) } else { None };
+        if !is_open { state.last_notified = None; }
+        return true;
+    }
+    false
+}
+
 fn send_notification(channel_id: &str, message: &str) {
-// ... (rest of the file stays same until main event loop)
     let url = format!("https://ntfy.sh/{}", channel_id);
     let client = reqwest::blocking::Client::new();
-    match client.post(&url).body(message.to_string()).send() {
-        Ok(res) => {
-            if res.status().is_success() {
-                println!("[{}] Notification sent: {}", Utc::now().format("%H:%M:%S"), message);
-            } else {
-                println!("[{}] Failed to send notification: status {}", Utc::now().format("%H:%M:%S"), res.status());
-            }
-        }
-        Err(e) => println!("[{}] Error sending notification: {}", Utc::now().format("%H:%M:%S"), e),
-    }
+    let _ = client.post(&url).body(message.to_string()).send();
 }
 
 #[tokio::main]
@@ -138,141 +127,169 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let channel_id = env::var("NTFY_CHANNEL_ID").expect("NTFY_CHANNEL_ID must be set in .env");
     let polling_interval = env::var("POLLING_INTERVAL_SECONDS").unwrap_or("1.0".into()).parse::<u64>().unwrap_or(1);
-    let threshold_minutes = env::var("DOOR_OPEN_THRESHOLD_MINUTES").unwrap_or("10.0".into()).parse::<f64>().unwrap_or(10.0);
+    let threshold_seconds = env::var("DOOR_OPEN_THRESHOLD_SECONDS").unwrap_or("600.0".into()).parse::<f64>().unwrap_or(600.0);
     let repeat_interval = env::var("NOTIFICATION_REPEAT_INTERVAL_SECONDS").unwrap_or("60.0".into()).parse::<u64>().unwrap_or(60);
-    let denylist_raw = env::var("BLUETOOTH_DENYLIST").unwrap_or_default();
-    let denylist = parse_denylist(&denylist_raw);
+    let denylist = Arc::new(parse_denylist(&env::var("BLUETOOTH_DENYLIST").unwrap_or_default()));
 
-    println!("--- RUST DOOR MONITOR ---");
-    println!("Channel ID: {}", channel_id);
-    println!("Threshold: {} min", threshold_minutes);
-    println!("Denylist: {} devices loaded", denylist.len());
+    let govee_count = Arc::new(AtomicU64::new(0));
+    let govee_count_clone = govee_count.clone();
 
+    println!("--- RUST DOOR MONITOR (DEBUG MODE) ---");
     let sensors: Arc<Mutex<HashMap<String, SensorState>>> = Arc::new(Mutex::new(HashMap::new()));
-    let sensors_clone = sensors.clone();
+    let sensors_processor = sensors.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, u32, bool)>();
 
-    // 1. Setup Bluetooth
-    let manager = Manager::new().await?;
-    let adapters = manager.adapters().await?;
-    let central = adapters.into_iter().next().ok_or("No Bluetooth adapters found")?;
+    let session = bluer::Session::new().await?;
+    let adapter = session.default_adapter().await?;
+    adapter.set_powered(true).await?;
+    println!("Adapter: {} (Powered ON)", adapter.name());
 
-    // 2. Start Scanning
-    central.start_scan(ScanFilter::default()).await?;
-    let mut events = central.events().await?;
-
-    println!("Scanner started. Watching for Govee sensors...");
-
-    // 3. Background Event Loop (Parser)
-    let central_clone = central.clone();
-    let mut ignored_devices = HashSet::new();
-    let mut govee_devices = HashSet::new();
-
+    let denylist_clone = denylist.clone();
+    let adapter_clone = adapter.clone();
+    let tx_clone = tx.clone();
+    
     tokio::spawn(async move {
-        while let Some(event) = events.next().await {
-            let (id, manufacturer_data): (btleplug::platform::PeripheralId, Option<HashMap<u16, Vec<u8>>>) = match event {
-                btleplug::api::CentralEvent::ManufacturerDataAdvertisement { id, manufacturer_data } => {
-                    let mac = normalize_mac(&id.to_string());
-                    if denylist.contains(&mac) {
-                        continue;
-                    }
-                    println!("[PASS] Advert: {}", mac);
-                    (id, Some(manufacturer_data))
-                }
-                btleplug::api::CentralEvent::DeviceUpdated(id) => {
-                    let mac = normalize_mac(&id.to_string());
-                    if denylist.contains(&mac) || ignored_devices.contains(&id) {
-                        continue;
-                    }
-                    println!("[PASS] Update: {}", mac);
+        let mut seen = HashSet::new();
+        let tx_spawn = tx_clone.clone();
+        let govee_spawn = govee_count_clone.clone();
+        let denylist_spawn = denylist_clone.clone();
+        let adapter_inner = adapter_clone.clone();
 
-                    // On some Linux systems, property changes are better caught here
-                    if let Ok(peripheral) = central_clone.peripheral(&id).await {
-                        if let Ok(Some(props)) = peripheral.properties().await {
-                            let is_govee = props.manufacturer_data.contains_key(&GOVEE_MANUFACTURER_ID);
-                            
-                            if !is_govee && !govee_devices.contains(&id) {
-                                ignored_devices.insert(id.clone());
-                                continue;
+        // Load pre-cached devices
+        if let Ok(addrs) = adapter_inner.device_addresses().await {
+            for addr in addrs {
+                let mac = addr.to_string().to_uppercase();
+                if denylist_spawn.contains(&mac) { continue; }
+                if let Ok(device) = adapter_inner.device(addr) {
+                    seen.insert(mac.clone());
+                    let tx_dev = tx_spawn.clone();
+                    let govee_dev = govee_spawn.clone();
+                    let mac_dev = mac.clone();
+                    tokio::spawn(async move {
+                        println!("[DEBUG] Monitoring known sensor: {}", mac_dev);
+                        let mut dev_events = device.events().await.unwrap();
+                        while let Some(de) = dev_events.next().await {
+                            if let DeviceEvent::PropertyChanged(prop) = de {
+                                match prop {
+                                    DeviceProperty::ManufacturerData(md) => {
+                                        if let Some(data) = md.get(&GOVEE_MANUFACTURER_ID).or_else(|| md.get(&GOVEE_ALT_ID)) {
+                                            govee_dev.fetch_add(1, Ordering::Relaxed);
+                                            let packet_ts = if data.len() >= 6 {
+                                                u32::from_be_bytes([data[2], data[3], data[4], data[5]])
+                                            } else { 0 };
+                                            if let Some(is_open) = decrypt_h5123(data).or_else(|| parse_fallback(data)) {
+                                                let _ = tx_dev.send((mac_dev.clone(), packet_ts, is_open));
+                                            }
+                                        }
+                                    },
+                                    DeviceProperty::Rssi(val) => {
+                                        // If we see RSSI but no manufacturer data, BlueZ is caching
+                                        // println!("[DEBUG] {} RSSI: {}", mac_dev, val);
+                                    },
+                                    _ => {}
+                                }
                             }
-                            
-                            if is_govee {
-                                govee_devices.insert(id.clone());
-                            }
-
-                            (id, Some(props.manufacturer_data))
-                        } else {
-                            continue;
                         }
-                    } else {
-                        continue;
-                    }
+                    });
                 }
-                _ => continue,
-            };
+            }
+        }
 
-            if let Some(data_map) = manufacturer_data {
-                if let Some(data) = data_map.get(&GOVEE_MANUFACTURER_ID) {
-                    println!("[DIAGNOSTIC] Govee signal: ID={:?}, data={:02X?}", id, data);
-                    // Try Decryption first, then Fallback
-                    let state = decrypt_h5123(data).or_else(|| parse_fallback(data));
+        // Start discovery
+        let filter = DiscoveryFilter { transport: DiscoveryTransport::Le, ..Default::default() };
+        let _ = adapter_inner.set_discovery_filter(filter).await;
+        let discovery_session = adapter_inner.discover_devices().await.unwrap();
+        let mut events = adapter_inner.events().await.unwrap();
 
-                    if let Some(is_open) = state {
-                        let mac = id.to_string();
-                        let mut map = sensors_clone.lock().unwrap();
-                        let now = Utc::now();
+        println!("[DEBUG] Scanning for new devices...");
 
+        while let Some(event) = events.next().await {
+            let _keep_alive = &discovery_session;
+            if let AdapterEvent::DeviceAdded(addr) = event {
+                println!("[DEBUG] New device discovered: {}", addr);
+                let mac = addr.to_string().to_uppercase();
+                if denylist_spawn.contains(&mac) || seen.contains(&mac) { continue; }
+                if let Ok(device) = adapter_inner.device(addr) {
+                    seen.insert(mac.clone());
+                    println!("[DEBUG] New sensor discovered: {}", mac);
+                    let tx_new = tx_spawn.clone();
+                    let govee_new = govee_spawn.clone();
+                    let mac_new = mac.clone();
+                    tokio::spawn(async move {
+                        let mut dev_events = device.events().await.unwrap();
+                        while let Some(de) = dev_events.next().await {
+                            if let DeviceEvent::PropertyChanged(DeviceProperty::ManufacturerData(md)) = de {
+                                if let Some(data) = md.get(&GOVEE_MANUFACTURER_ID).or_else(|| md.get(&GOVEE_ALT_ID)) {
+                                    govee_new.fetch_add(1, Ordering::Relaxed);
+                                    let packet_ts = if data.len() >= 6 {
+                                        u32::from_be_bytes([data[2], data[3], data[4], data[5]])
+                                    } else { 0 };
+                                    if let Some(is_open) = decrypt_h5123(data).or_else(|| parse_fallback(data)) {
+                                        let _ = tx_new.send((mac_new.clone(), packet_ts, is_open));
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    // Processor Task
+    tokio::spawn(async move {
+        let mut event_buffer = Vec::new();
+        loop {
+            let timeout = time::sleep(Duration::from_millis(500));
+            tokio::select! {
+                Some(event) = rx.recv() => { event_buffer.push(event); }
+                _ = timeout => {
+                    if event_buffer.is_empty() { continue; }
+                    event_buffer.sort_by_key(|e| e.1);
+                    let mut map = sensors_processor.lock().unwrap();
+                    let now = Utc::now();
+                    for (mac, packet_ts, is_open) in event_buffer.drain(..) {
                         let entry = map.entry(mac.clone()).or_insert_with(|| {
-                            println!("[{}] Discovered sensor: {}", now.format("%H:%M:%S"), mac);
+                            println!("[{}] Discovered: {}", now.format("%H:%M:%S"), mac);
                             SensorState {
-                                is_open,
-                                last_seen: now,
-                                open_since: if is_open { Some(now) } else { None },
-                                last_notified: None,
+                                is_open, last_seen: now, open_since: if is_open { Some(now) } else { None },
+                                last_notified: None, last_packet_timestamp: packet_ts,
                             }
                         });
-
-                        // Handle state changes
-                        if entry.is_open != is_open {
-                            println!("[{}] {} state change: {} -> {}", now.format("%H:%M:%S"), mac, if entry.is_open { "OPEN" } else { "CLOSED" }, if is_open { "OPEN" } else { "CLOSED" });
-                            entry.is_open = is_open;
-                            if is_open {
-                                entry.open_since = Some(now);
-                            } else {
-                                entry.open_since = None;
-                                entry.last_notified = None;
-                            }
-                        }
-                        
-                        // Update last seen regardless of state change
-                        entry.last_seen = now;
+                        apply_sensor_update(entry, is_open, packet_ts, now, &mac);
                     }
                 }
             }
         }
     });
 
-    // 4. Main Polling Loop (Monitor/Notifier)
-    let threshold_duration = chrono::Duration::seconds((threshold_minutes * 60.0) as i64);
     let mut interval = time::interval(Duration::from_secs(polling_interval));
+    let mut last_heartbeat = Utc::now();
 
     loop {
         interval.tick().await;
         let now = Utc::now();
+        if (now - last_heartbeat).num_seconds() >= 60 {
+            println!("[{}] HB: Govee Packets: {}", now.format("%H:%M:%S"), govee_count.load(Ordering::Relaxed));
+            last_heartbeat = now;
+        }
         let mut map = sensors.lock().unwrap();
-
         for (mac, state) in map.iter_mut() {
             if state.is_open {
                 if let Some(open_since) = state.open_since {
                     let duration = now - open_since;
-                    if duration >= threshold_duration {
+                    if duration >= chrono::Duration::seconds(threshold_seconds as i64) {
                         let should_notify = match state.last_notified {
                             Some(last) => (now - last).num_seconds() >= repeat_interval as i64,
                             None => true,
                         };
-
                         if should_notify {
-                            let minutes = duration.num_minutes();
-                            let message = format!("Door Sensor {} has been open for {} minutes!", mac, minutes);
+                            let duration_str = if duration.num_minutes() > 0 {
+                                format!("{} mins", duration.num_minutes())
+                            } else {
+                                format!("{} secs", duration.num_seconds())
+                            };
+                            let message = format!("Door Sensor {} open for {}!", mac, duration_str);
                             send_notification(&channel_id, &message);
                             state.last_notified = Some(now);
                         }
@@ -286,54 +303,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn test_normalize_mac_dbus() {
-        let input = "HCI0/DEV_40_F3_B0_89_32_60";
-        assert_eq!(normalize_mac(input), "40:F3:B0:89:32:60");
-    }
-
-    #[test]
-    fn test_normalize_mac_standard() {
-        let input = "40-f3-b0-89-32-60";
-        assert_eq!(normalize_mac(input), "40:F3:B0:89:32:60");
-    }
-
-    #[test]
-    fn test_parse_denylist() {
-        let raw = "40:F3:B0:89:32:60, AA:BB:CC:DD:EE:FF , , 12:34:56:78:90:AB";
-        let list = parse_denylist(raw);
-        assert_eq!(list.len(), 3);
-        assert!(list.contains("40:F3:B0:89:32:60"));
-        assert!(list.contains("AA:BB:CC:DD:EE:FF"));
-        assert!(list.contains("12:34:56:78:90:AB"));
-    }
-
-    #[test]
-    fn test_decrypt_h5123_open() {
-        // Sample from user: 13 b6 03 f3 3b ... (Open)
-        let data = hex::decode("13b603f33bbd8bc589b8e2c54172a7ca6e25bfbdfca58cac").unwrap();
-        assert_eq!(decrypt_h5123(&data), Some(true));
-    }
-
-    #[test]
-    fn test_decrypt_h5123_closed() {
-        // Sample from user: 13 b6 03 f3 d3 ... (Closed)
-        let data = hex::decode("13b603f3d3b1e19b34632fd464b3e9c3768346fae9e9f349").unwrap();
-        assert_eq!(decrypt_h5123(&data), Some(false));
-    }
-
-    #[test]
-    fn test_parse_fallback_open() {
-        // index 4 is 0x01 (Open)
-        let data = [0x13, 0xb6, 0x03, 0xff, 0x01];
-        assert_eq!(parse_fallback(&data), Some(true));
-    }
-
-    #[test]
-    fn test_parse_fallback_closed() {
-        // index 4 is 0x00 (Closed)
-        let data = [0x13, 0xb6, 0x03, 0xff, 0x00];
-        assert_eq!(parse_fallback(&data), Some(false));
+    fn test_apply_sensor_update_ordering() {
+        let mut state = SensorState {
+            is_open: false, last_seen: Utc::now(), open_since: None, last_notified: None,
+            last_packet_timestamp: 1000,
+        };
+        let now = Utc::now();
+        let changed = apply_sensor_update(&mut state, true, 1100, now, "TEST");
+        assert!(changed);
+        assert!(state.is_open);
     }
 }
