@@ -100,6 +100,22 @@ fn parse_fallback(data: &[u8]) -> Option<bool> {
     }
 }
 
+fn normalize_mac(id: &str) -> String {
+    let id = id.to_uppercase();
+    if let Some(pos) = id.find("DEV_") {
+        id[pos + 4..].replace("_", ":")
+    } else {
+        id.replace("-", ":")
+    }
+}
+
+fn parse_denylist(raw: &str) -> HashSet<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn send_notification(channel_id: &str, message: &str) {
 // ... (rest of the file stays same until main event loop)
     let url = format!("https://ntfy.sh/{}", channel_id);
@@ -124,10 +140,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let polling_interval = env::var("POLLING_INTERVAL_SECONDS").unwrap_or("1.0".into()).parse::<u64>().unwrap_or(1);
     let threshold_minutes = env::var("DOOR_OPEN_THRESHOLD_MINUTES").unwrap_or("10.0".into()).parse::<f64>().unwrap_or(10.0);
     let repeat_interval = env::var("NOTIFICATION_REPEAT_INTERVAL_SECONDS").unwrap_or("60.0".into()).parse::<u64>().unwrap_or(60);
+    let denylist_raw = env::var("BLUETOOTH_DENYLIST").unwrap_or_default();
+    let denylist = parse_denylist(&denylist_raw);
 
     println!("--- RUST DOOR MONITOR ---");
     println!("Channel ID: {}", channel_id);
     println!("Threshold: {} min", threshold_minutes);
+    println!("Denylist: {} devices loaded", denylist.len());
 
     let sensors: Arc<Mutex<HashMap<String, SensorState>>> = Arc::new(Mutex::new(HashMap::new()));
     let sensors_clone = sensors.clone();
@@ -152,12 +171,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(event) = events.next().await {
             let (id, manufacturer_data): (btleplug::platform::PeripheralId, Option<HashMap<u16, Vec<u8>>>) = match event {
                 btleplug::api::CentralEvent::ManufacturerDataAdvertisement { id, manufacturer_data } => {
+                    let mac = normalize_mac(&id.to_string());
+                    if denylist.contains(&mac) {
+                        continue;
+                    }
+                    println!("[PASS] Advert: {}", mac);
                     (id, Some(manufacturer_data))
                 }
                 btleplug::api::CentralEvent::DeviceUpdated(id) => {
-                    if ignored_devices.contains(&id) {
+                    let mac = normalize_mac(&id.to_string());
+                    if denylist.contains(&mac) || ignored_devices.contains(&id) {
                         continue;
                     }
+                    println!("[PASS] Update: {}", mac);
 
                     // On some Linux systems, property changes are better caught here
                     if let Ok(peripheral) = central_clone.peripheral(&id).await {
@@ -260,6 +286,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_mac_dbus() {
+        let input = "HCI0/DEV_40_F3_B0_89_32_60";
+        assert_eq!(normalize_mac(input), "40:F3:B0:89:32:60");
+    }
+
+    #[test]
+    fn test_normalize_mac_standard() {
+        let input = "40-f3-b0-89-32-60";
+        assert_eq!(normalize_mac(input), "40:F3:B0:89:32:60");
+    }
+
+    #[test]
+    fn test_parse_denylist() {
+        let raw = "40:F3:B0:89:32:60, AA:BB:CC:DD:EE:FF , , 12:34:56:78:90:AB";
+        let list = parse_denylist(raw);
+        assert_eq!(list.len(), 3);
+        assert!(list.contains("40:F3:B0:89:32:60"));
+        assert!(list.contains("AA:BB:CC:DD:EE:FF"));
+        assert!(list.contains("12:34:56:78:90:AB"));
+    }
 
     #[test]
     fn test_decrypt_h5123_open() {
